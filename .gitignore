@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+ENV/
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+*.docx
+*.xml
+*.html
+*.zip
+.~lock.*
