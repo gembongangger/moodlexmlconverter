@@ -50,10 +50,6 @@
             {% endif %}
             <form action="{{ url_for('upload_keys', file_id=data.file_id) }}" method="post" enctype="multipart/form-data">
                 <input type="file" name="key_file" accept=".xlsx,.xls" required>
-                <select name="paket">
-                    <option value="PAKET A">PAKET A</option>
-                    <option value="PAKET B">PAKET B</option>
-                </select>
                 <button type="submit" class="btn-upload">Upload</button>
             </form>
         </div>

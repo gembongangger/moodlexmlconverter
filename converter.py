@@ -495,12 +495,12 @@ def save_to_xml(data, output_path):
 
 # ---- EXCEL KEY PARSER ----
 
-def parse_keys_from_excel(excel_path, packet_label="PAKET A"):
+def parse_keys_from_excel(excel_path):
     wb = openpyxl.load_workbook(excel_path)
     ws = wb.active
 
     keys = {}
-    found_header = False
+    data_cols = {2, 10, 16}
 
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=False):
         vals = [(cell.column, cell.value) for cell in row]
@@ -508,24 +508,15 @@ def parse_keys_from_excel(excel_path, packet_label="PAKET A"):
         if not non_null:
             continue
 
-        text_concatenated = ' '.join(str(v).strip().upper() for _, v in non_null)
-
-        if packet_label.upper() in text_concatenated:
-            found_header = True
-            continue
-
-        if not found_header:
-            continue
-
-        skip = ['NO. SOAL', 'PERNYATAAN', 'PG.', 'PG KOMPLEKS', 'BENAR-SALAH', 'CATATAN:', 'PAKET A']
-        if any(h in text_concatenated for h in skip):
-            continue
-
-        # Detect next packet — stop
-        if 'PAKET ' in text_concatenated:
-            break
-
         col_data = {c: v for c, v in non_null}
+
+        # Only parse rows that have a number in a soal-number column
+        has_soal_number = any(
+            c in col_data and isinstance(col_data[c], (int, float))
+            for c in data_cols
+        )
+        if not has_soal_number:
+            continue
 
         # PG Tunggal: columns B-C, D-E, F-G, H-I (2-9)
         for col_no in (2, 4, 6, 8):

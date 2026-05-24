@@ -88,15 +88,13 @@ def upload_keys(file_id):
     if not (fn.endswith(".xlsx") or fn.endswith(".xls")):
         return "Sementara hanya dukung file Excel (.xlsx/.xls) ya. Dukungan Word kunci menyusul 🙂", 400
 
-    paket = request.form.get("paket", "PAKET A")
-
     tmp_path = os.path.join(UPLOAD_FOLDER, f"keys_{file_id}_{file.filename}")
     file.save(tmp_path)
 
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    keys = parse_keys_from_excel(tmp_path, paket)
+    keys = parse_keys_from_excel(tmp_path)
 
     data["questions"] = merge_keys(data["questions"], keys)
     data["key_filename"] = file.filename
