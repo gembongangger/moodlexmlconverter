@@ -7,6 +7,18 @@ import json
 from converter import extract_questions_dict, save_to_xml, parse_keys_from_excel, merge_keys
 from pdf2docx import Converter
 
+def _embed_for_review(text, imgs):
+    def _replacer(m):
+        name = m.group(1)
+        if name in imgs:
+            ext = name.rsplit('.', 1)[-1].lower() if '.' in name else 'png'
+            mime_map = {'png': 'image/png', 'jpeg': 'image/jpeg', 'jpg': 'image/jpeg',
+                        'gif': 'image/gif', 'svg': 'image/svg+xml'}
+            mime = mime_map.get(ext, 'image/png')
+            return f'data:{mime};base64,{imgs[name]}'
+        return m.group(0)
+    return re.sub(r'@@PLUGINFILE@@/([^\s"\'<>]+)', _replacer, text)
+
 UPLOAD_FOLDER = "uploads"
 OUTPUT_FOLDER = "outputs"
 DATA_FOLDER = "data"
@@ -73,6 +85,18 @@ def review(file_id):
     if not os.path.exists(json_path): return redirect(url_for('index'))
     with open(json_path, "r") as f:
         data = json.load(f)
+
+    imgs = data.get("images_binary", {})
+    if imgs:
+        for q in data["questions"]:
+            q["text"] = _embed_for_review(q["text"], imgs)
+            if q.get("type") == "matching":
+                for sq in q.get("sub_questions", []):
+                    sq["text"] = _embed_for_review(sq["text"], imgs)
+            else:
+                for i, opt in enumerate(q.get("options", [])):
+                    q["options"][i] = _embed_for_review(opt, imgs)
+
     return render_template("review.html", data=data)
 
 @app.route("/upload_keys/<file_id>", methods=["POST"])
