@@ -2,8 +2,6 @@ import re
 import base64
 import os
 import pypandoc
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from docx import Document
 import zipfile
 import openpyxl
@@ -30,7 +28,7 @@ def _replace_img_src(text, images_binary_b64):
     imgs = re.findall(r'<img [^>]*src="([^"]+)"', text)
     for src in imgs:
         base_name = os.path.basename(src)
-        text = text.replace(src, f'@@PLUGINFILE__/{base_name}')
+        text = text.replace(src, f'@@PLUGINFILE@@/{base_name}')
     return text
 
 def _html_to_text(html):
@@ -165,6 +163,7 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
             if ol_tag_match:
                 raw = ol_tag_match.group()
                 raw = re.sub(r'</?ol[^>]*>', '', raw)
+                raw = re.sub(r'</?li[^>]*>', '', raw)
                 raw = raw.strip()
                 raw_text = re.sub(r'<[^>]+>', '', raw).strip()
                 if raw_text and not any(k in raw_text[:20].lower() for k in ['nomor', 'soal nomor', 'petunjuk', 'berilah']):
@@ -202,6 +201,7 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
             if ol_tag_match:
                 raw = ol_tag_match.group()
                 raw = re.sub(r'</?ol[^>]*>', '', raw)
+                raw = re.sub(r'</?li[^>]*>', '', raw)
                 raw = raw.strip()
                 passage = clean_html(raw)
                 passage = _replace_img_src(passage, images_binary_b64)
@@ -382,82 +382,116 @@ def _embed_images_in_text(txt, imgs_b64):
     txt = re.sub(r'<th', r'<th style="border: 1px solid black; padding: 5px;"', txt)
     return txt
 
-def _add_images_to_node(node, txt, imgs_b64):
+def _xml_escape(text):
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    text = text.replace('"', '&quot;')
+    return text
+
+def _cdata(text):
+    return f'<![CDATA[{text}]]>'
+
+def _file_tags(txt, imgs_b64):
+    out = ''
     for img_name in imgs_b64:
-        if f'@@PLUGINFILE__/{img_name}' in txt:
-            f_tag = ET.SubElement(node, "file", name=img_name, path="/", encoding="base64")
-            f_tag.text = imgs_b64[img_name]
+        if f'@@PLUGINFILE@@/{img_name}' in txt:
+            out += f'  <file name="{_xml_escape(img_name)}" path="/" encoding="base64">{imgs_b64[img_name]}</file>\n'
+    return out
 
-def save_multichoice_xml(item, quiz, imgs_b64):
-    q = ET.SubElement(quiz, "question", type="multichoice")
-    ET.SubElement(ET.SubElement(q, "name"), "text").text = f"Soal {item['number']}"
-    qtext_node = ET.SubElement(q, "questiontext", format="html")
+def _question_xml(item, imgs_b64):
+    txt = _embed_images_in_text(item["text"], imgs_b64)
+    num = item["number"]
 
-    txt = item["text"]
-    _add_images_to_node(qtext_node, txt, imgs_b64)
-    txt = _embed_images_in_text(txt, imgs_b64)
-    ET.SubElement(qtext_node, "text").text = txt
+    file_tags = _file_tags(txt, imgs_b64)
+    out = f'''  <question type="multichoice">
+    <name>
+      <text>{_xml_escape(f"Soal {num}")}</text>
+    </name>
+    <questiontext format="html">
+{file_tags}      <text>{_cdata(txt)}</text>
+    </questiontext>
+'''
 
     num_keys = len(item["keys"])
     is_single = num_keys <= 1
-    ET.SubElement(q, "single").text = "true" if is_single else "false"
-    ET.SubElement(q, "answernumbering").text = "abc"
-    ET.SubElement(q, "shuffleanswers").text = "1"
-
-    ET.SubElement(q, "correctfeedback").text = "Jawaban Anda benar."
-    ET.SubElement(q, "partiallycorrectfeedback").text = "Sebagian benar."
-    ET.SubElement(q, "incorrectfeedback").text = "Jawaban Anda salah."
+    out += f'''    <single>{"true" if is_single else "false"}</single>
+    <answernumbering>abc</answernumbering>
+    <shuffleanswers>1</shuffleanswers>
+    <correctfeedback><text>Jawaban Anda benar.</text></correctfeedback>
+    <partiallycorrectfeedback><text>Sebagian benar.</text></partiallycorrectfeedback>
+    <incorrectfeedback><text>Jawaban Anda salah.</text></incorrectfeedback>
+'''
 
     for i, opt_text in enumerate(item["options"]):
         label = chr(65 + i)
         correct = label in item["keys"]
         fraction = str(100 / max(1, num_keys)) if correct else ("0" if is_single else str((-1)*100 / (5-max(1, num_keys))))
+        span_text = f"<span>{opt_text}</span>"
+        feedback_text = "Benar" if correct else "Salah"
+        opt_file_tags = _file_tags(opt_text, imgs_b64)
+        out += f'''    <answer fraction="{fraction}" format="html">
+{opt_file_tags}      <text>{_cdata(span_text)}</text>
+      <feedback><text>{feedback_text}</text></feedback>
+    </answer>
+'''
 
-        ans_node = ET.SubElement(q, "answer", fraction=fraction, format="html")
+    out += '  </question>\n'
+    return out
 
-        _add_images_to_node(ans_node, opt_text, imgs_b64)
+def _matching_xml(item, imgs_b64):
+    txt = _embed_images_in_text(item["text"], imgs_b64)
+    num = item["number"]
 
-        ET.SubElement(ans_node, "text").text = f"<span>{opt_text}</span>"
-        ET.SubElement(ET.SubElement(ans_node, "feedback"), "text").text = "Benar" if correct else "Salah"
-
-def save_matching_xml(item, quiz, imgs_b64):
-    q = ET.SubElement(quiz, "question", type="matching")
-    ET.SubElement(ET.SubElement(q, "name"), "text").text = f"Soal {item['number']}"
-    qtext_node = ET.SubElement(q, "questiontext", format="html")
-
-    txt = item["text"]
-    _add_images_to_node(qtext_node, txt, imgs_b64)
-    txt = _embed_images_in_text(txt, imgs_b64)
-    ET.SubElement(qtext_node, "text").text = txt
-
-    ET.SubElement(q, "shuffleanswers").text = "0"
+    file_tags = _file_tags(txt, imgs_b64)
+    out = f'''  <question type="matching">
+    <name>
+      <text>{_xml_escape(f"Soal {num}")}</text>
+    </name>
+    <questiontext format="html">
+{file_tags}      <text>{_cdata(txt)}</text>
+    </questiontext>
+    <shuffleanswers>0</shuffleanswers>
+'''
 
     for sq in item.get("sub_questions", []):
-        sub_q = ET.SubElement(q, "subquestion", format="html")
-        _add_images_to_node(sub_q, sq["text"], imgs_b64)
-        ET.SubElement(sub_q, "text").text = sq["text"]
-        ans = ET.SubElement(sub_q, "answer")
-        ET.SubElement(ans, "text").text = sq.get("answer", "Benar")
+        sq_text = sq["text"]
+        answer = sq.get("answer", "Benar")
+        sq_file_tags = _file_tags(sq_text, imgs_b64)
+        out += f'''    <subquestion format="html">
+{sq_file_tags}      <text>{_cdata(sq_text)}</text>
+      <answer>
+        <text>{_xml_escape(answer)}</text>
+      </answer>
+    </subquestion>
+'''
+
+    out += '  </question>\n'
+    return out
 
 def save_to_xml(data, output_path):
-    quiz = ET.Element("quiz")
-    cat_q = ET.SubElement(quiz, "question", type="category")
-    cat_node = ET.SubElement(cat_q, "category")
-    ET.SubElement(cat_node, "text").text = f"$course$/{data['category']}"
-
     imgs_b64 = data.get("images_binary", {})
+
+    xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<quiz>
+  <question type="category">
+    <category>
+      <text>$course$/''' + _xml_escape(data['category']) + '''</text>
+    </category>
+  </question>
+'''
 
     for item in data["questions"]:
         qtype = item.get("type", "multichoice")
         if qtype == "matching":
-            save_matching_xml(item, quiz, imgs_b64)
+            xml += _matching_xml(item, imgs_b64)
         else:
-            save_multichoice_xml(item, quiz, imgs_b64)
+            xml += _question_xml(item, imgs_b64)
 
-    xml_data = ET.tostring(quiz, encoding='utf-8')
-    pretty_xml = minidom.parseString(xml_data).toprettyxml(indent="  ")
+    xml += '</quiz>\n'
+
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(pretty_xml)
+        f.write(xml)
 
 # ---- EXCEL KEY PARSER ----
 
