@@ -160,7 +160,7 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
             ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
             if ol_num_m: parent_num = ol_num_m[-1]
 
-            ol_m = re.findall(r'(?:<ol(?:\s+start="\d+")?\s+type="1">|^)\s*\d+\.\s*(.*?)(?:\n|$)', preceding, re.DOTALL)
+            ol_m = re.findall(r'<ol(?:\s+start="\d+")?\s+type="1">\s*<li>(.*?)</li>', preceding, re.DOTALL)
             passage = ""
             if ol_m:
                 last_li_text = ol_m[-1].strip()
@@ -193,7 +193,7 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
             ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
             parent_num = ol_num_m[-1] if ol_num_m else str(len([q for q in questions_list if q.get('type') != 'truefalse']) + 1)
 
-            ol_m = re.findall(r'(?:<ol(?:\s+start="\d+")?\s+type="1">|^)\s*\d+\.\s*(.*?)(?:\n|$)', preceding, re.DOTALL)
+            ol_m = re.findall(r'<ol(?:\s+start="\d+")?\s+type="1">\s*<li>(.*?)</li>', preceding, re.DOTALL)
             passage = ""
             if ol_m:
                 passage = clean_html(ol_m[-1])
