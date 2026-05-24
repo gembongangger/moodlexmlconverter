@@ -73,8 +73,13 @@
 
             {% for soal in data.questions %}
             {% set tipe = soal.get('type', 'multichoice') %}
-            {% set badge_class = 'badge-tf' if tipe == 'truefalse' else ('badge-pgk' if soal['keys']|length > 1 else 'badge-pgt') %}
-            {% set tipe_label = 'Benar/Salah' if tipe == 'truefalse' else ('PG Kompleks' if soal['keys']|length > 1 else 'PG Tunggal') %}
+            {% if tipe == 'matching' %}
+            {% set badge_class = 'badge-tf' %}
+            {% set tipe_label = 'Menjodohkan' %}
+            {% else %}
+            {% set badge_class = 'badge-pgk' if soal['keys']|length > 1 else 'badge-pgt' %}
+            {% set tipe_label = 'PG Kompleks' if soal['keys']|length > 1 else 'PG Tunggal' %}
+            {% endif %}
             <div class="soal-card" id="card-{{ loop.index0 }}">
                 <div class="soal-header">
                     <div class="checkbox-container">
@@ -83,19 +88,26 @@
                         <span class="soal-num">Soal {{ soal.number }}</span>
                         <span class="badge {{ badge_class }}">{{ tipe_label }}</span>
                     </div>
-                    <div>
-                        <span style="font-size:0.85em; color:#d93025"><strong>Kunci:</strong> {{ soal['keys'] | join(', ') }}</span>
-                    </div>
                 </div>
                 
                 <div class="soal-text">
                     {{ soal.text | safe }}
                 </div>
 
-                {% if tipe == 'truefalse' %}
-                <div>
-                    <span class="tf-item {% if 'B' in soal['keys'] %}true{% else %}unselected{% endif %}">Benar</span>
-                    <span class="tf-item {% if 'S' in soal['keys'] %}false{% else %}unselected{% endif %}">Salah</span>
+                {% if tipe == 'matching' %}
+                <div class="options-list">
+                    {% for sq in soal.sub_questions %}
+                    {% set ans = sq.get('answer', '') %}
+                    {% set correct_class = 'correct' if ans else '' %}
+                    <div class="option-item {{ correct_class }}">
+                        <strong>{{ loop.index }}.</strong> {{ sq.text }}
+                        {% if ans %}
+                        <span style="float:right; font-weight:bold; color:{% if ans == 'Benar' %}#188038{% else %}#d93025{% endif %}">
+                            → {{ ans }}
+                        </span>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
                 </div>
                 {% else %}
                 <div class="options-list">

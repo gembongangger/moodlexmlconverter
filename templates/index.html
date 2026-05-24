@@ -115,10 +115,10 @@
                 <span class="stat-label">- PG Kompleks:</span>
                 <span class="stat-value">{{ stats.pg_kompleks }}</span>
             </div>
-            {% if stats.get('truefalse') %}
+            {% if stats.get('matching') %}
             <div class="stat-row">
-                <span class="stat-label">- Benar/Salah:</span>
-                <span class="stat-value">{{ stats.truefalse }}</span>
+                <span class="stat-label">- Menjodohkan:</span>
+                <span class="stat-value">{{ stats.matching }}</span>
             </div>
             {% endif %}
             <div class="stat-row">

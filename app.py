@@ -132,7 +132,7 @@ def generate():
     # Hitung statistik riil dari soal yang dipilih
     pg_tunggal = sum(1 for q in selected_questions if q.get('type') == 'multichoice' and len(q.get('keys', [])) <= 1)
     pg_kompleks = sum(1 for q in selected_questions if q.get('type') == 'multichoice' and len(q.get('keys', [])) > 1)
-    tf_count = sum(1 for q in selected_questions if q.get('type') == 'truefalse')
+    matching_count = sum(1 for q in selected_questions if q.get('type') == 'matching')
     total_gambar = sum(len(re.findall(r'@@PLUGINFILE@@', q['text'])) for q in selected_questions)
     total_tabel = sum(len(re.findall(r'<table', q['text'])) for q in selected_questions)
 
@@ -140,7 +140,7 @@ def generate():
         "total_soal": len(selected_questions),
         "pg_tunggal": pg_tunggal,
         "pg_kompleks": pg_kompleks,
-        "truefalse": tf_count,
+        "matching": matching_count,
         "total_gambar": total_gambar,
         "total_tabel": total_tabel,
         "category": data["category"],

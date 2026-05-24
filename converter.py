@@ -153,10 +153,10 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
 
         preceding = full_html[:table_start]
 
-        # Detect True/False
+        # Detect True/False → matching
         tf_items = _detect_tf_table(table_html)
         if tf_items:
-            parent_num = str(len([q for q in questions_list if q.get('type') == 'truefalse']) // 4 + 37)
+            parent_num = str(len([q for q in questions_list if q.get('type') == 'matching']) + 37)
             ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
             if ol_num_m: parent_num = ol_num_m[-1]
 
@@ -168,17 +168,21 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
                 if last_li_text and not any(k in last_li_text[:20].lower() for k in ['nomor', 'soal nomor', 'petunjuk', 'berilah']):
                     passage = clean_html(ol_m[-1])
 
+            sub_questions = []
             for sub in tf_items:
-                sub_num = sub["sub_number"]
                 sub_text = _html_to_text(sub['text'])
-                full_text = passage + "<br/>" + sub_text if passage else sub_text
-                questions_list.append({
-                    "type": "truefalse",
-                    "number": f"{parent_num}.{sub_num}",
-                    "parent_number": parent_num,
-                    "text": full_text,
-                    "keys": []
+                sub_questions.append({
+                    "text": sub_text,
+                    "answer": ""  # will be filled from keys
                 })
+
+            questions_list.append({
+                "type": "matching",
+                "number": parent_num,
+                "text": passage if passage else f"Soal {parent_num}",
+                "sub_questions": sub_questions,
+                "keys": []
+            })
 
             pos = end
             continue
@@ -257,8 +261,17 @@ def _parse_with_ol(full_html, images_binary_b64, category_name):
             regex_nums_parent.add(q["number"])
 
     for tq in table_questions:
-        if tq["type"] == "truefalse":
-            questions_from_regex.append(tq)
+        if tq["type"] == "matching":
+            # Replace any regex entry with same number (matching has richer data)
+            idx_to_replace = None
+            for j, q in enumerate(questions_from_regex):
+                if q.get("number") == tq["number"]:
+                    idx_to_replace = j
+                    break
+            if idx_to_replace is not None:
+                questions_from_regex[idx_to_replace] = tq
+            else:
+                questions_from_regex.append(tq)
         elif tq["number"] not in regex_nums:
             questions_from_regex.append(tq)
         elif tq["number"] not in regex_nums_parent:
@@ -395,24 +408,24 @@ def save_multichoice_xml(item, quiz, imgs_b64):
         ET.SubElement(ans_node, "text").text = f"<span>{opt_text}</span>"
         ET.SubElement(ET.SubElement(ans_node, "feedback"), "text").text = "Benar" if correct else "Salah"
 
-def save_truefalse_xml(item, quiz, imgs_b64):
-    q = ET.SubElement(quiz, "question", type="truefalse")
+def save_matching_xml(item, quiz, imgs_b64):
+    q = ET.SubElement(quiz, "question", type="matching")
     ET.SubElement(ET.SubElement(q, "name"), "text").text = f"Soal {item['number']}"
     qtext_node = ET.SubElement(q, "questiontext", format="html")
 
     txt = item["text"]
     _add_images_to_node(qtext_node, txt, imgs_b64)
+    txt = _embed_images_in_text(txt, imgs_b64)
     ET.SubElement(qtext_node, "text").text = txt
 
-    is_benar = any(k.upper() == 'B' for k in item.get("keys", []))
+    ET.SubElement(q, "shuffleanswers").text = "0"
 
-    ans_true = ET.SubElement(q, "answer", fraction="100" if is_benar else "0")
-    ET.SubElement(ans_true, "text").text = "true"
-    ET.SubElement(ET.SubElement(ans_true, "feedback"), "text").text = "Benar" if is_benar else "Salah"
-
-    ans_false = ET.SubElement(q, "answer", fraction="0" if is_benar else "100")
-    ET.SubElement(ans_false, "text").text = "false"
-    ET.SubElement(ET.SubElement(ans_false, "feedback"), "text").text = "Salah" if is_benar else "Benar"
+    for sq in item.get("sub_questions", []):
+        sub_q = ET.SubElement(q, "subquestion", format="html")
+        _add_images_to_node(sub_q, sq["text"], imgs_b64)
+        ET.SubElement(sub_q, "text").text = sq["text"]
+        ans = ET.SubElement(sub_q, "answer")
+        ET.SubElement(ans, "text").text = sq.get("answer", "Benar")
 
 def save_to_xml(data, output_path):
     quiz = ET.Element("quiz")
@@ -424,8 +437,8 @@ def save_to_xml(data, output_path):
 
     for item in data["questions"]:
         qtype = item.get("type", "multichoice")
-        if qtype == "truefalse":
-            save_truefalse_xml(item, quiz, imgs_b64)
+        if qtype == "matching":
+            save_matching_xml(item, quiz, imgs_b64)
         else:
             save_multichoice_xml(item, quiz, imgs_b64)
 
@@ -511,15 +524,28 @@ def parse_keys_from_excel(excel_path, packet_label="PAKET A"):
 def merge_keys(questions, keys_dict):
     merged = []
     for q in questions:
+        q = dict(q) if "key_source" not in q else q
         qnum = q["number"]
-        if qnum in keys_dict:
-            q = dict(q)
+
+        if q.get("type") == "matching":
+            # Map per sub-question: keys stored as "37.1", "37.2", etc.
+            key_mapped = False
+            for sidx, sq in enumerate(q.get("sub_questions", [])):
+                sub_key = keys_dict.get(f"{qnum}.{sidx + 1}", [])
+                if sub_key:
+                    sq["answer"] = "Benar" if sub_key[0].upper() == 'B' else "Salah"
+                    key_mapped = True
+            if key_mapped:
+                q["key_source"] = "file"
+            elif "key_source" not in q:
+                q["key_source"] = "auto"
+        elif qnum in keys_dict:
             q["keys"] = keys_dict[qnum]
             q["key_source"] = "file"
         else:
-            q = dict(q) if "key_source" not in q else q
             if "key_source" not in q:
                 q["key_source"] = "auto"
+
         merged.append(q)
     return merged
 
