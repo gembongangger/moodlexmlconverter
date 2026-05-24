@@ -13,3 +13,8 @@ outputs/*
 *.html
 *.zip
 .~lock.*
+data/
+.codegraph/
+*.xlsx
+*.pdf
+.DS_Store

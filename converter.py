@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from docx import Document
 import zipfile
+import openpyxl
 
 def get_docx_images(docx_path):
     images = {}
@@ -14,8 +15,8 @@ def get_docx_images(docx_path):
             for file in z.namelist():
                 if file.startswith('word/media/'):
                     img_name = os.path.basename(file)
-                    images[img_name] = z.read(file)
-    except Exception as e:
+                    images[img_name] = base64.b64encode(z.read(file)).decode('utf-8')
+    except Exception:
         pass
     return images
 
@@ -23,161 +24,506 @@ def clean_html(html):
     if not html: return ""
     html = re.sub(r'^\s*<\/(?:p|li|h[1-6]|ul|ol|strong|span|em|i|b)>', '', html, flags=re.IGNORECASE)
     html = re.sub(r'<(?:p|li|h[1-6]|ul|ol|strong|span|em|i|b)[^>]*>\s*$', '', html, flags=re.IGNORECASE)
-    html = re.sub(r'<(p|li|ul|ol|span|strong)[^>]*>\s*<\/\1>', '', html, flags=re.IGNORECASE)
     return html.strip()
 
-def create_moodle_xml(docx_path, output_path):
-    print(f"\n[1/4] Membaca file: {os.path.basename(docx_path)}...")
-    
-    stats = {
-        "total_soal": 0,
-        "pg_tunggal": 0,
-        "pg_kompleks": 0,
-        "total_gambar": 0,
-        "total_tabel": 0,
-        "category": "Bank Soal",
-        "status": "GAGAL"
-    }
+def _replace_img_src(text, images_binary_b64):
+    imgs = re.findall(r'<img [^>]*src="([^"]+)"', text)
+    for src in imgs:
+        base_name = os.path.basename(src)
+        text = text.replace(src, f'@@PLUGINFILE@@/{base_name}')
+    return text
 
+def _html_to_text(html):
+    return re.sub(r'<[^>]+>', '', html).strip()
+
+def _find_matching_close(html, start, close_tag):
+    open_tag = close_tag.replace('/', '')
+    tag_base = open_tag.replace('<', '').split()[0]
+    depth = 1
+    pos = start
+    while pos < len(html) and depth > 0:
+        if html[pos:].startswith(open_tag) and html[pos+len(open_tag):pos+len(open_tag)+1] in (' ', '>', '\n', '\r', '\t'):
+            depth += 1
+            pos += len(open_tag)
+        elif html[pos:pos+len(close_tag)] == close_tag:
+            depth -= 1
+            if depth == 0:
+                return pos + len(close_tag)
+            pos += len(close_tag)
+        else:
+            pos += 1
+    return len(html)
+
+def _preprocess_ol_to_explicit(html):
+    """Convert pandoc <ol> lists to explicit numbering for regex parsing.
+    Process <ol type='A'> first (innermost), then <ol type='1'> (outermost).
+    """
+    # Step 1: Process all <ol type="A"> (options) — innermost
+    while True:
+        m = re.search(r'<ol\s+type="[Aa]"[^>]*>', html)
+        if not m: break
+        start = m.end()
+        end = _find_matching_close(html, start, '</ol>')
+        content = html[start:end-len('</ol>')]
+        letter = ord('A')
+        processed_parts = []
+        li_pos = 0
+        while li_pos < len(content):
+            li_m = re.match(r'<li>(.*?)</li>', content[li_pos:], re.DOTALL)
+            if li_m:
+                processed_parts.append(f'{chr(letter)}. {li_m.group(1).strip()}')
+                letter += 1
+                li_pos += li_m.end()
+            else:
+                processed_parts.append(content[li_pos])
+                li_pos += 1
+        replacement = ' '.join(processed_parts)
+        html = html[:m.start()] + replacement + html[end:]
+
+    # Step 2: Process all <ol type="1"> (questions)
+    while True:
+        m = re.search(r'<ol(?:\s+start="(\d+)")?\s+type="1"[^>]*>', html)
+        if not m: break
+        start_num = int(m.group(1)) if m.group(1) else 1
+        start = m.end()
+        end = _find_matching_close(html, start, '</ol>')
+        content = html[start:end-len('</ol>')]
+        num = start_num
+        processed_parts = []
+        li_pos = 0
+        while li_pos < len(content):
+            li_m = re.match(r'<li>(.*?)</li>', content[li_pos:], re.DOTALL)
+            if li_m:
+                li_text = li_m.group(1).strip()
+                if not li_text.startswith(f'{num}.'):
+                    processed_parts.append(f'{num}. {li_text}')
+                else:
+                    processed_parts.append(li_text)
+                num += 1
+                li_pos += li_m.end()
+            else:
+                processed_parts.append(content[li_pos])
+                li_pos += 1
+        replacement = '\n'.join(processed_parts)
+        html = html[:m.start()] + replacement + html[end:]
+
+    return html
+
+def _detect_tf_table(html_block):
+    if '<table' not in html_block: return None
+    has_benar = re.search(r'BENAR|SALAH', html_block, flags=re.IGNORECASE)
+    if not has_benar: return None
+    rows = re.findall(r'<tr>(.*?)</tr>', html_block, flags=re.DOTALL)
+    if not rows: return None
+    header_row = rows[0]
+    has_tf_header = ('BENAR' in header_row.upper()) and ('SALAH' in header_row.upper())
+    if not has_tf_header or len(rows) < 2: return None
+    sub_items = []
+    for row in rows[1:]:
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, flags=re.DOTALL)
+        if len(cells) >= 2:
+            sub_num = _html_to_text(cells[0]).strip()
+            sub_text = cells[1].strip()
+            sub_items.append({"sub_number": sub_num, "text": sub_text})
+    return sub_items if sub_items else None
+
+def _detect_pgk_table(html_block):
+    if '<table' not in html_block: return None
+    if re.search(r'BENAR|SALAH', html_block, flags=re.IGNORECASE): return None
+    if not (re.search(r'Pilihan', html_block, flags=re.IGNORECASE) and re.search(r'Pernyataan', html_block, flags=re.IGNORECASE)):
+        return None
+    rows = re.findall(r'<tr>(.*?)</tr>', html_block, flags=re.DOTALL)
+    if len(rows) < 2: return None
+    sub_items = []
+    for row in rows[1:]:
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, flags=re.DOTALL)
+        if len(cells) >= 2:
+            sub_items.append(cells[1].strip())
+    return sub_items if sub_items else None
+
+def _parse_tables(full_html, images_binary_b64, questions_list):
+    """Find table blocks that follow <ol> questions and parse PGK/TF tables."""
+    pos = 0
+    while pos < len(full_html):
+        table_start = full_html.find('<table', pos)
+        if table_start < 0: break
+
+        end = _find_matching_close(full_html, table_start + len('<table'), '</table>')
+        table_html = full_html[table_start:end]
+
+        preceding = full_html[:table_start]
+
+        # Detect True/False
+        tf_items = _detect_tf_table(table_html)
+        if tf_items:
+            parent_num = str(len([q for q in questions_list if q.get('type') == 'truefalse']) // 4 + 37)
+            ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
+            if ol_num_m: parent_num = ol_num_m[-1]
+
+            ol_m = re.findall(r'(?:<ol(?:\s+start="\d+")?\s+type="1">|^)\s*\d+\.\s*(.*?)(?:\n|$)', preceding, re.DOTALL)
+            passage = ""
+            if ol_m:
+                last_li_text = ol_m[-1].strip()
+                last_li_text = re.sub(r'<[^>]+>', '', last_li_text).strip()
+                if last_li_text and not any(k in last_li_text[:20].lower() for k in ['nomor', 'soal nomor', 'petunjuk', 'berilah']):
+                    passage = clean_html(ol_m[-1])
+
+            for sub in tf_items:
+                sub_num = sub["sub_number"]
+                sub_text = _html_to_text(sub['text'])
+                full_text = passage + "<br/>" + sub_text if passage else sub_text
+                questions_list.append({
+                    "type": "truefalse",
+                    "number": f"{parent_num}.{sub_num}",
+                    "parent_number": parent_num,
+                    "text": full_text,
+                    "keys": []
+                })
+
+            pos = end
+            continue
+
+        # Detect PG Kompleks
+        pgk_items = _detect_pgk_table(table_html)
+        if pgk_items:
+            ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
+            parent_num = ol_num_m[-1] if ol_num_m else str(len([q for q in questions_list if q.get('type') != 'truefalse']) + 1)
+
+            ol_m = re.findall(r'(?:<ol(?:\s+start="\d+")?\s+type="1">|^)\s*\d+\.\s*(.*?)(?:\n|$)', preceding, re.DOTALL)
+            passage = ""
+            if ol_m:
+                passage = clean_html(ol_m[-1])
+
+            options = [clean_html(re.sub(r'</?ol[^>]*>', '', txt)) for txt in pgk_items]
+
+            questions_list.append({
+                "type": "multichoice",
+                "number": parent_num,
+                "text": passage if passage else f"Soal {parent_num}",
+                "options": options,
+                "keys": []
+            })
+            pos = end
+            continue
+
+        pos = end
+
+def extract_questions_dict(docx_path):
     try:
         full_html = pypandoc.convert_file(docx_path, 'html', format='docx', extra_args=['--mathjax', '--wrap=none'])
     except Exception as e:
-        print(f"ERROR: Gagal menjalankan Pandoc: {e}")
-        return stats
+        return {"questions": [], "category": f"Error: {e}"}
 
-    images_binary = get_docx_images(docx_path)
-    
+    images_binary_b64 = get_docx_images(docx_path)
+
     try:
         doc = Document(docx_path)
         category_name = doc.paragraphs[0].text.strip() if doc.paragraphs else "Bank Soal"
     except:
         category_name = "Bank Soal"
-    
-    stats["category"] = category_name
 
-    quiz = ET.Element("quiz")
-    cat_q = ET.SubElement(quiz, "question", type="category")
-    cat_node = ET.SubElement(cat_q, "category")
-    ET.SubElement(cat_node, "text").text = f"$course$/{category_name}"
+    if '<ol type="1">' in full_html or '<ol start=' in full_html:
+        questions = _parse_with_ol(full_html, images_binary_b64, category_name)
+    else:
+        questions = _parse_with_regex(full_html, images_binary_b64, category_name)
 
-    soal_pattern = r'<(p|li|h[1-6])[^>]*>(?:\s*<(?:strong|span|em)[^>]*>)*\s*(?:\[soal\s+no\s+\d+\]|(?:\d+[\.\)])(?:\s|&nbsp;)*|Soal\s*\d+|Nomor\s*\d+)'
-    soal_matches = list(re.finditer(soal_pattern, full_html, flags=re.IGNORECASE))
-    
+    return {
+        "category": category_name,
+        "questions": questions,
+        "images_binary": images_binary_b64
+    }
+
+def _parse_with_ol(full_html, images_binary_b64, category_name):
+    raw_html = full_html
+
+    # Step 1: Parse tables (PGK and TF) from the raw HTML first
+    table_questions = []
+    _parse_tables(raw_html, images_binary_b64, table_questions)
+
+    # Step 2: Pre-process OL lists to explicit numbering
+    processed = _preprocess_ol_to_explicit(full_html)
+
+    # Step 3: Use regex parser on the processed HTML
+    questions_from_regex = _parse_by_regex_inner(processed, images_binary_b64)
+
+    # Step 4: Merge table-based questions (no opt matches found by regex)
+    # Identify which questions from tables are NOT already in the regex results
+    regex_nums = set(q["number"] for q in questions_from_regex)
+    regex_nums_parent = set()
+    for q in questions_from_regex:
+        if q.get("type") == "truefalse":
+            regex_nums_parent.add(q.get("parent_number", q["number"]))
+        else:
+            regex_nums_parent.add(q["number"])
+
+    for tq in table_questions:
+        if tq["type"] == "truefalse":
+            questions_from_regex.append(tq)
+        elif tq["number"] not in regex_nums:
+            questions_from_regex.append(tq)
+        elif tq["number"] not in regex_nums_parent:
+            questions_from_regex.append(tq)
+
+    return questions_from_regex
+
+def _parse_by_regex_inner(full_html, images_binary_b64):
+    """Regex-based parser for pre-processed HTML with explicit numbering."""
+    soal_pattern = r'(?:^|\n)\s*(?:<(?:p|div)[^>]*>)?\s*(?:\[soal\s+no\s+\d+\]|(\d+)[\.\)](?:\s|&nbsp;)*|Soal\s*(\d+)|Nomor\s*(\d+))(?:</(?:p|div)>)?'
+    soal_matches = list(re.finditer(soal_pattern, full_html, flags=re.IGNORECASE | re.MULTILINE))
+
     if not soal_matches:
-        soal_pattern = r'<(p|li|h[1-6])[^>]*>(?:\s*<(?:strong|span|em)[^>]*>)*\s*(?:\d+[\.\)])(?:\s|&nbsp;)*'
-        soal_matches = list(re.finditer(soal_pattern, full_html, flags=re.IGNORECASE))
+        soal_pattern = r'(?:^|\n)\s*(?:<(?:p|div)[^>]*>)?\s*(\d+)[\.\)](?:\s|&nbsp;)*'
+        soal_matches = list(re.finditer(soal_pattern, full_html, flags=re.IGNORECASE | re.MULTILINE))
 
-    print(f"[2/4] Menganalisis konten... (Ditemukan {len(soal_matches)} calon blok soal)")
+    questions = []
+    current_passage = None
+
+    def detect_shared_passage(text):
+        match = re.search(r'Teks\s+ini\s+digunakan\s+untuk\s+menjawab\s+soal\s+nomor\s+(\d+)\s*[–\-]\s*(\d+)', text, flags=re.IGNORECASE)
+        if match: return int(match.group(1)), int(match.group(2))
+        return None
 
     for i in range(len(soal_matches)):
         start = soal_matches[i].end()
         end = soal_matches[i+1].start() if i+1 < len(soal_matches) else len(full_html)
-        block = full_html[start:end]
-        
-        opt_pattern = r'(?:\[opsi\s+[a-e]\]|<(?:li|p|h[1-6])[^>]*>(?:\s*<(?:p|strong|span|em)[^>]*>)?\s*[a-e][\.\)](?:\s|&nbsp;)*)'
-        opt_matches = list(re.finditer(opt_pattern, block, flags=re.IGNORECASE))
-        
-        if not opt_matches: continue
+        block = full_html[start:end].strip()
 
-        stats["total_soal"] += 1
-        
-        tag_text = re.sub(r'<[^>]+>', '', soal_matches[i].group(0))
-        num_match = re.search(r'(\d+)', tag_text)
-        num = num_match.group(1) if num_match else str(stats["total_soal"])
+        num_val = None
+        for g in soal_matches[i].groups():
+            if g is not None:
+                num_val = int(g)
+                break
+        if num_val is None:
+            num_val = i + 1
+
+        opt_pattern = r'(?:\[opsi\s+[a-e]\]|(?:^|(?<=[>\s]))([A-Ea-e])[\.\)](?:\s|&nbsp;)*)'
+        opt_matches = list(re.finditer(opt_pattern, block, flags=re.IGNORECASE | re.MULTILINE))
+
+        if not opt_matches:
+            rng = detect_shared_passage(block)
+            if rng: current_passage = {"text": block, "start": rng[0], "end": rng[1]}
+            continue
+
+        q_text_raw = block[:opt_matches[0].start()]
+        q_text_raw = _replace_img_src(q_text_raw, images_binary_b64)
+
+        final_q_text = q_text_raw
+        if current_passage and current_passage["start"] <= num_val <= current_passage["end"]:
+            p_text = _replace_img_src(current_passage["text"], images_binary_b64)
+            final_q_text = f"<div style='background:#f4f4f4; padding:10px; border:1px solid #ddd; border-radius:5px;'>{p_text}</div><br/>{q_text_raw}"
 
         key_pattern = r'(?:\[kunci\s*:\s*|Kunci\s*(?:Jawaban)?\s*[:\.]\s*|Jawaban\s*[:\.]\s*)(?:<(?:strong|span|p)[^>]*>)?\s*([a-e,\s]+)'
         key_match = re.search(key_pattern, block, flags=re.IGNORECASE)
-        keys = []
-        if key_match:
-            raw_key = re.sub(r'<[^>]+>', '', key_match.group(1))
-            keys = [k.strip().upper() for k in raw_key.split(',')]
+        keys = [k.strip().upper() for k in re.sub(r'<[^>]+>', '', key_match.group(1)).split(',')] if key_match else []
 
-        if len(keys) > 1:
-            stats["pg_kompleks"] += 1
-        else:
-            stats["pg_tunggal"] += 1
-
-        question_html_raw = block[:opt_matches[0].start()]
         options = []
         for j in range(len(opt_matches)):
             opt_start = opt_matches[j].end()
-            lookahead = r'(?:\[opsi\s+[a-e]\]|<(?:li|p|h[1-6])[^>]*>(?:\s*<(?:p|strong|span|em)[^>]*>)?\s*[a-e][\.\)]|\[kunci\s*:|Kunci\s*(?:Jawaban)?\s*[:\.]|Jawaban\s*[:\.]|Pembahasan)'
-            next_search = block[opt_start:]
-            opt_end_match = re.search(lookahead, next_search, flags=re.IGNORECASE)
-            opt_end = opt_start + (opt_end_match.start() if opt_end_match else len(next_search))
-            options.append(block[opt_start:opt_end])
+            # Look for next option label or key marker (not HTML tags)
+            if j + 1 < len(opt_matches):
+                opt_end = opt_matches[j + 1].start()
+            else:
+                # Look for key marker after last option
+                key_marker = re.search(r'(?:\[kunci\s*:|Kunci\s*(?:Jawaban)?\s*[:\.]|Jawaban\s*[:\.])', block[opt_start:], flags=re.IGNORECASE)
+                if key_marker:
+                    opt_end = opt_start + key_marker.start()
+                else:
+                    opt_end = len(block)
 
-        q = ET.SubElement(quiz, "question", type="multichoice")
-        ET.SubElement(ET.SubElement(q, "name"), "text").text = f"Soal {num}"
-        qtext_node = ET.SubElement(q, "questiontext", format="html")
-        
-        processed_qtext = clean_html(question_html_raw)
-        stats["total_tabel"] += len(re.findall(r'<table', processed_qtext, flags=re.IGNORECASE))
-        img_tags = re.findall(r'<img [^>]*src="([^"]+)"', processed_qtext)
-        for img_src in img_tags:
-            base_name = os.path.basename(img_src)
-            if base_name in images_binary:
-                stats["total_gambar"] += 1
-                f_tag = ET.SubElement(qtext_node, "file", name=base_name, path="/", encoding="base64")
-                f_tag.text = base64.b64encode(images_binary[base_name]).decode('utf-8')
-                processed_qtext = processed_qtext.replace(img_src, f'@@PLUGINFILE@@/{base_name}')
-        
-        processed_qtext = re.sub(r'<table', r'<table border="1" style="border-collapse: collapse; width: 100%;"', processed_qtext)
-        processed_qtext = re.sub(r'<td', r'<td style="border: 1px solid black; padding: 5px;"', processed_qtext)
-        processed_qtext = re.sub(r'<th', r'<th style="border: 1px solid black; padding: 5px;"', processed_qtext)
-        ET.SubElement(qtext_node, "text").text = processed_qtext
+            clean_opt = block[opt_start:opt_end].strip()
+            clean_opt = re.sub(r'^.*?\[opsi\s+[a-e]\]', '', clean_opt, flags=re.IGNORECASE)
+            clean_opt = re.sub(r'</?p[^>]*>', '', clean_opt)
+            clean_opt = _replace_img_src(clean_opt, images_binary_b64)
+            options.append(clean_html(clean_opt))
 
-        num_keys = len(keys)
-        is_single = num_keys <= 1
-        ET.SubElement(q, "single").text = "true" if is_single else "false"
-        ET.SubElement(q, "answernumbering").text = "abc"
-        ET.SubElement(q, "shuffleanswers").text = "1"
+        questions.append({
+            "type": "multichoice",
+            "number": str(num_val),
+            "text": clean_html(final_q_text),
+            "options": options,
+            "keys": keys
+        })
 
-        for i, opt_raw in enumerate(options):
-            label = chr(65 + i)
-            correct = label in keys
-            fraction = str(100 / max(1, num_keys)) if correct else ("0" if is_single else str((-1)*100 / (5-max(1, num_keys))))
-            ans_node = ET.SubElement(q, "answer", fraction=fraction, format="html")
-            clean_opt = re.sub(r'^.*?\[opsi\s+[a-e]\]', '', opt_raw, flags=re.IGNORECASE)
-            if clean_opt == opt_raw:
-                clean_opt = re.sub(r'^\s*[a-e][\.\)]\s*', '', opt_raw, flags=re.IGNORECASE)
-            clean_opt = clean_html(clean_opt)
-            ET.SubElement(ans_node, "text").text = f"<span>{clean_opt}</span>"
-            ET.SubElement(ET.SubElement(ans_node, "feedback"), "text").text = "Benar" if correct else "Salah"
+    return questions
 
-    print(f"[3/4] Membuat file XML...")
+def _parse_with_regex(full_html, images_binary_b64, category_name):
+    return _parse_by_regex_inner(full_html, images_binary_b64)
+
+# ---- XML OUTPUT ----
+
+def _embed_images_in_text(txt, imgs_b64):
+    txt = re.sub(r'<table', r'<table border="1" style="border-collapse: collapse; width: 100%;"', txt)
+    txt = re.sub(r'<td', r'<td style="border: 1px solid black; padding: 5px;"', txt)
+    txt = re.sub(r'<th', r'<th style="border: 1px solid black; padding: 5px;"', txt)
+    return txt
+
+def _add_images_to_node(node, txt, imgs_b64):
+    for img_name in imgs_b64:
+        if f'@@PLUGINFILE@@/{img_name}' in txt:
+            f_tag = ET.SubElement(node, "file", name=img_name, path="/", encoding="base64")
+            f_tag.text = imgs_b64[img_name]
+
+def save_multichoice_xml(item, quiz, imgs_b64):
+    q = ET.SubElement(quiz, "question", type="multichoice")
+    ET.SubElement(ET.SubElement(q, "name"), "text").text = f"Soal {item['number']}"
+    qtext_node = ET.SubElement(q, "questiontext", format="html")
+
+    txt = item["text"]
+    _add_images_to_node(qtext_node, txt, imgs_b64)
+    txt = _embed_images_in_text(txt, imgs_b64)
+    ET.SubElement(qtext_node, "text").text = txt
+
+    num_keys = len(item["keys"])
+    is_single = num_keys <= 1
+    ET.SubElement(q, "single").text = "true" if is_single else "false"
+    ET.SubElement(q, "answernumbering").text = "abc"
+    ET.SubElement(q, "shuffleanswers").text = "1"
+
+    ET.SubElement(q, "correctfeedback").text = "Jawaban Anda benar."
+    ET.SubElement(q, "partiallycorrectfeedback").text = "Sebagian benar."
+    ET.SubElement(q, "incorrectfeedback").text = "Jawaban Anda salah."
+
+    for i, opt_text in enumerate(item["options"]):
+        label = chr(65 + i)
+        correct = label in item["keys"]
+        fraction = str(100 / max(1, num_keys)) if correct else ("0" if is_single else str((-1)*100 / (5-max(1, num_keys))))
+
+        ans_node = ET.SubElement(q, "answer", fraction=fraction, format="html")
+
+        _add_images_to_node(ans_node, opt_text, imgs_b64)
+
+        ET.SubElement(ans_node, "text").text = f"<span>{opt_text}</span>"
+        ET.SubElement(ET.SubElement(ans_node, "feedback"), "text").text = "Benar" if correct else "Salah"
+
+def save_truefalse_xml(item, quiz, imgs_b64):
+    q = ET.SubElement(quiz, "question", type="truefalse")
+    ET.SubElement(ET.SubElement(q, "name"), "text").text = f"Soal {item['number']}"
+    qtext_node = ET.SubElement(q, "questiontext", format="html")
+
+    txt = item["text"]
+    _add_images_to_node(qtext_node, txt, imgs_b64)
+    ET.SubElement(qtext_node, "text").text = txt
+
+    is_benar = any(k.upper() == 'B' for k in item.get("keys", []))
+
+    ans_true = ET.SubElement(q, "answer", fraction="100" if is_benar else "0")
+    ET.SubElement(ans_true, "text").text = "true"
+    ET.SubElement(ET.SubElement(ans_true, "feedback"), "text").text = "Benar" if is_benar else "Salah"
+
+    ans_false = ET.SubElement(q, "answer", fraction="0" if is_benar else "100")
+    ET.SubElement(ans_false, "text").text = "false"
+    ET.SubElement(ET.SubElement(ans_false, "feedback"), "text").text = "Salah" if is_benar else "Benar"
+
+def save_to_xml(data, output_path):
+    quiz = ET.Element("quiz")
+    cat_q = ET.SubElement(quiz, "question", type="category")
+    cat_node = ET.SubElement(cat_q, "category")
+    ET.SubElement(cat_node, "text").text = f"$course$/{data['category']}"
+
+    imgs_b64 = data.get("images_binary", {})
+
+    for item in data["questions"]:
+        qtype = item.get("type", "multichoice")
+        if qtype == "truefalse":
+            save_truefalse_xml(item, quiz, imgs_b64)
+        else:
+            save_multichoice_xml(item, quiz, imgs_b64)
+
     xml_data = ET.tostring(quiz, encoding='utf-8')
     pretty_xml = minidom.parseString(xml_data).toprettyxml(indent="  ")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(pretty_xml)
-    
-    stats["status"] = "BERHASIL"
-    print("[4/4] Konversi Selesai.")
 
-    # Tampilkan laporan di layar
-    print("\n" + "="*45)
-    print("        RINGKASAN HASIL KONVERSI")
-    print("="*45)
-    print(f" File Input      : {os.path.basename(docx_path)}")
-    print(f" Kategori Moodle : {stats['category']}")
-    print("-" * 45)
-    print(f" Total Soal      : {stats['total_soal']}")
-    print(f"  - PG Tunggal   : {stats['pg_tunggal']}")
-    print(f"  - PG Kompleks  : {stats['pg_kompleks']}")
-    print(f" Total Gambar    : {stats['total_gambar']}")
-    print(f" Total Tabel     : {stats['total_tabel']}")
-    print("-" * 45)
-    print(f" STATUS          : {stats['status']}")
-    print(f" File Output     : {os.path.basename(output_path)}")
-    print("="*45 + "\n")
-    
-    return stats
+# ---- EXCEL KEY PARSER ----
 
-if __name__ == "__main__":
-    import sys
-    FILE_INPUT = sys.argv[1] if len(sys.argv) > 1 else "template.docx"
-    FILE_OUTPUT = sys.argv[2] if len(sys.argv) > 2 else "hasil_moodle.xml"
-    if os.path.exists(FILE_INPUT):
-        create_moodle_xml(FILE_INPUT, FILE_OUTPUT)
-    else:
-        print(f"Error: File {FILE_INPUT} tidak ditemukan.")
+def parse_keys_from_excel(excel_path, packet_label="PAKET A"):
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb.active
+
+    keys = {}
+    found_header = False
+
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=False):
+        vals = [(cell.column, cell.value) for cell in row]
+        non_null = [(c, v) for c, v in vals if v is not None]
+        if not non_null:
+            continue
+
+        text_concatenated = ' '.join(str(v).strip().upper() for _, v in non_null)
+
+        if packet_label.upper() in text_concatenated:
+            found_header = True
+            continue
+
+        if not found_header:
+            continue
+
+        skip = ['NO. SOAL', 'PERNYATAAN', 'PG.', 'PG KOMPLEKS', 'BENAR-SALAH', 'CATATAN:', 'PAKET A']
+        if any(h in text_concatenated for h in skip):
+            continue
+
+        # Detect next packet — stop
+        if 'PAKET ' in text_concatenated:
+            break
+
+        col_data = {c: v for c, v in non_null}
+
+        # PG Tunggal: columns B-C, D-E, F-G, H-I (2-9)
+        for col_no in (2, 4, 6, 8):
+            col_key = col_no + 1
+            if col_no in col_data and col_key in col_data:
+                no_val = col_data[col_no]
+                key_val = col_data[col_key]
+                if isinstance(no_val, (int, float)):
+                    no_str = str(int(no_val))
+                    key_str = str(key_val).strip().upper()
+                    if key_str in 'ABCDE':
+                        keys[no_str] = [key_str]
+
+        # PG Kompleks: column J (10)
+        if 10 in col_data:
+            soal_val = col_data[10]
+            if isinstance(soal_val, (int, float)):
+                no_str = str(int(soal_val))
+                correct_indices = []
+                for idx, col in enumerate([11, 12, 13, 14, 15]):
+                    if col in col_data:
+                        val = str(col_data[col]).strip().upper()
+                        if val == 'B':
+                            correct_indices.append(chr(65 + idx))
+                if correct_indices:
+                    keys[no_str] = correct_indices
+
+        # Benar-Salah: column P (16)
+        if 16 in col_data:
+            soal_val = col_data[16]
+            if isinstance(soal_val, (int, float)):
+                parent_no = str(int(soal_val))
+                for idx, col in enumerate([17, 18, 19, 20]):
+                    if col in col_data:
+                        key_str = str(col_data[col]).strip().upper()
+                        if key_str in ('B', 'S'):
+                            sub_no = f"{parent_no}.{idx + 1}"
+                            keys[sub_no] = [key_str]
+
+    return keys
+
+def merge_keys(questions, keys_dict):
+    merged = []
+    for q in questions:
+        qnum = q["number"]
+        if qnum in keys_dict:
+            q = dict(q)
+            q["keys"] = keys_dict[qnum]
+            q["key_source"] = "file"
+        else:
+            q = dict(q) if "key_source" not in q else q
+            if "key_source" not in q:
+                q["key_source"] = "auto"
+        merged.append(q)
+    return merged
+
+def create_moodle_xml(docx_path, output_path):
+    data = extract_questions_dict(docx_path)
+    save_to_xml(data, output_path)
+    return {"total_soal": len(data["questions"]), "category": data["category"], "status": "BERHASIL"}

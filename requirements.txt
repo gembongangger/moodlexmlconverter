@@ -1,3 +1,5 @@
 flask
 pypandoc
 python-docx
+pdf2docx
+openpyxl
