@@ -30,7 +30,7 @@ def _replace_img_src(text, images_binary_b64):
     imgs = re.findall(r'<img [^>]*src="([^"]+)"', text)
     for src in imgs:
         base_name = os.path.basename(src)
-        text = text.replace(src, f'@@PLUGINFILE@@/{base_name}')
+        text = text.replace(src, f'@@PLUGINFILE__/{base_name}')
     return text
 
 def _html_to_text(html):
@@ -160,17 +160,21 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
             ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
             if ol_num_m: parent_num = ol_num_m[-1]
 
-            ol_m = re.findall(r'<ol(?:\s+start="\d+")?\s+type="1">\s*<li>(.*?)</li>', preceding, re.DOTALL)
             passage = ""
-            if ol_m:
-                last_li_text = ol_m[-1].strip()
-                last_li_text = re.sub(r'<[^>]+>', '', last_li_text).strip()
-                if last_li_text and not any(k in last_li_text[:20].lower() for k in ['nomor', 'soal nomor', 'petunjuk', 'berilah']):
-                    passage = clean_html(ol_m[-1])
+            ol_tag_match = re.search(rf'<ol\s+start="{re.escape(parent_num)}"\s+type="1">.*', preceding, re.DOTALL)
+            if ol_tag_match:
+                raw = ol_tag_match.group()
+                raw = re.sub(r'</?ol[^>]*>', '', raw)
+                raw = raw.strip()
+                raw_text = re.sub(r'<[^>]+>', '', raw).strip()
+                if raw_text and not any(k in raw_text[:20].lower() for k in ['nomor', 'soal nomor', 'petunjuk', 'berilah']):
+                    passage = clean_html(raw)
+                    passage = _replace_img_src(passage, images_binary_b64)
 
             sub_questions = []
             for sub in tf_items:
-                sub_text = _html_to_text(sub['text'])
+                sub_text = sub['text']
+                sub_text = _replace_img_src(sub_text, images_binary_b64)
                 sub_questions.append({
                     "text": sub_text,
                     "answer": ""  # will be filled from keys
@@ -193,12 +197,20 @@ def _parse_tables(full_html, images_binary_b64, questions_list):
             ol_num_m = re.findall(r'<ol\s+start="(\d+)"\s+type="1">', preceding)
             parent_num = ol_num_m[-1] if ol_num_m else str(len([q for q in questions_list if q.get('type') != 'truefalse']) + 1)
 
-            ol_m = re.findall(r'<ol(?:\s+start="\d+")?\s+type="1">\s*<li>(.*?)</li>', preceding, re.DOTALL)
             passage = ""
-            if ol_m:
-                passage = clean_html(ol_m[-1])
+            ol_tag_match = re.search(rf'<ol\s+start="{re.escape(parent_num)}"\s+type="1">.*', preceding, re.DOTALL)
+            if ol_tag_match:
+                raw = ol_tag_match.group()
+                raw = re.sub(r'</?ol[^>]*>', '', raw)
+                raw = raw.strip()
+                passage = clean_html(raw)
+                passage = _replace_img_src(passage, images_binary_b64)
 
-            options = [clean_html(re.sub(r'</?ol[^>]*>', '', txt)) for txt in pgk_items]
+            options = []
+            for txt in pgk_items:
+                clean_txt = re.sub(r'</?ol[^>]*>', '', txt)
+                clean_txt = _replace_img_src(clean_txt, images_binary_b64)
+                options.append(clean_html(clean_txt))
 
             questions_list.append({
                 "type": "multichoice",
@@ -372,7 +384,7 @@ def _embed_images_in_text(txt, imgs_b64):
 
 def _add_images_to_node(node, txt, imgs_b64):
     for img_name in imgs_b64:
-        if f'@@PLUGINFILE@@/{img_name}' in txt:
+        if f'@@PLUGINFILE__/{img_name}' in txt:
             f_tag = ET.SubElement(node, "file", name=img_name, path="/", encoding="base64")
             f_tag.text = imgs_b64[img_name]
 
