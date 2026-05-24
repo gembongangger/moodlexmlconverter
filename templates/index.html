@@ -87,7 +87,9 @@
         <div class="upload-section">
             <form method="post" enctype="multipart/form-data">
                 <p style="font-size: 0.9em; color: #5f6368;">Upload file DOCX atau PDF untuk dikonversi ke XML Moodle</p>
-                <input type="file" name="file" accept=".docx,.pdf" required><br><br>
+                <input type="file" name="file" accept=".docx,.pdf" required><br>
+                <input type="text" name="category_name" placeholder="Nama kategori (contoh: MATEMATIKA TINGKAT LANJUT)" 
+                       style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px; margin:10px 0; box-sizing:border-box;"><br>
                 <button type="submit">Konversi Sekarang</button>
             </form>
         </div>

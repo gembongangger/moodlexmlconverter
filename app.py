@@ -45,6 +45,11 @@ def index():
 
         # Ekstrak data mentah
         data = extract_questions_dict(actual_docx_path)
+        category_from_form = request.form.get("category_name", "").strip()
+        if category_from_form:
+            data["category"] = category_from_form
+        elif not data.get("category"):
+            data["category"] = "Bank Soal"
         data["file_id"] = file_id
         data["original_name"] = file.filename
         
