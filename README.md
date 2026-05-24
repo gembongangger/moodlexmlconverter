@@ -4,6 +4,8 @@ A web-based tool to convert Microsoft Word (.docx) documents into Moodle XML for
 
 ## Features
 
+- **PDF Auto-Recognition**: Automatically converts uploaded PDF files to DOCX before processing.
+
 - **Smart Detection**: Recognizes question numbers (1., Soal 1, etc.), options (A., [opsi A]), and answer keys automatically.
 - **Media Support**: Automatically extracts and embeds images into the XML.
 - **Table Formatting**: Converts Word tables into clean HTML tables with borders compatible with Moodle.
@@ -63,3 +65,4 @@ What is the capital of Indonesia?
 
 ## License
 MIT
+# moodlexmlconverter
